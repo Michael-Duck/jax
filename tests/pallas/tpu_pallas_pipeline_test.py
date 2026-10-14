@@ -904,6 +904,35 @@ class PallasCallPipelineTest(jtu.JaxTestCase):
     ):
       run(x)
 
+  def test_static_num_programs_in_index_map_and_body(self):
+    def index_map(i):
+      n = pl.num_programs(0)
+      self.assertIsInstance(n, int)
+      return (n - 1 - i,)
+
+    def body(x_ref, o_ref):
+      n = pl.num_programs(0)
+      self.assertIsInstance(n, int)
+      o_ref[...] = x_ref[...] + jnp.float32(n)
+
+    def kernel(x_hbm_ref, o_hbm_ref):
+      pltpu.emit_pipeline(
+          body,
+          grid=(4,),
+          in_specs=[pl.BlockSpec((128,), index_map)],
+          out_specs=[pl.BlockSpec((128,), lambda i: (i,))],
+      )(x_hbm_ref, o_hbm_ref)
+
+    x = jnp.arange(512, dtype=jnp.float32)
+    out = pl.pallas_call(
+        kernel,
+        in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+        out_shape=jax.ShapeDtypeStruct((512,), jnp.float32),
+    )(x)
+    expected = x.reshape(4, 128)[::-1].reshape(512) + 4.0
+    np.testing.assert_allclose(out, expected)
+
 
 @jtu.with_config(jax_pallas_poison_buffers=True)
 class PallasCallPipelinePoisonTest(jtu.JaxTestCase):
@@ -1795,12 +1824,7 @@ class PallasCallMegacoreTest(jtu.JaxTestCase):
 
     out = func()
     out_np = np.array(out)
-    if config.use_emit_pipeline_primitive.value:
-      # New primitives resolves num_programs to the full grid.
-      expected_nprogs = grid_size
-    else:
-      # Legacy behavior: num_programs reports the partitioned grid size.
-      expected_nprogs = grid_size // num_cores
+    expected_nprogs = grid_size // num_cores
     for i in range(grid_size):
       pid, nprogs = int(out_np[i, 0]), int(out_np[i, 1])
       asize, aindex = int(out_np[i, 2]), int(out_np[i, 3])
@@ -2871,6 +2895,55 @@ class EmitPipelineVmapTest(jtu.JaxTestCase):
     )
     out = jax.jit(run_kernel)(x)
     expected_out = x + grid_size
+    np.testing.assert_allclose(out, expected_out)
+
+  @parameterized.product(dynamic_grid=[True, False])
+  def test_vmap_megacore_partitions_batch_axis(self, dynamic_grid):
+    if not jax.config.jax_use_emit_pipeline_primitive:
+      self.skipTest('vmap requires jax_use_emit_pipeline_primitive == True.')
+    num_cores = pltpu.get_tpu_info().num_cores
+    grid_size = 3
+    out_type = jax.ShapeDtypeStruct(
+        (num_cores, 16, 128 * grid_size), jnp.int32
+    )
+    mesh = pltpu.TensorCoreMesh(axis_name='core')
+
+    @pl.kernel(out_type=out_type, mesh=mesh)
+    def run_kernel(x_ref, o_ref):
+      core_id = jax.lax.axis_index('core')
+
+      def body(x_ref, o_ref):
+        o_ref[...] = x_ref[...] + pl.num_programs(1) + 100 * core_id
+
+      grid = (1, jnp.array(grid_size)) if dynamic_grid else (1, grid_size)
+      jax.vmap(
+          pltpu.emit_pipeline(
+              body,
+              grid=grid,
+              in_specs=[
+                  pl.BlockSpec(
+                      (16, 128), lambda _, i: (0, pl.num_programs(1) - 1 - i)
+                  )
+              ],
+              out_specs=[
+                  pl.BlockSpec(
+                      (16, 128), lambda _, i: (0, pl.num_programs(1) - 1 - i)
+                  )
+              ],
+              core_axis_name='core',
+              dimension_semantics=(pltpu.ARBITRARY, pltpu.PARALLEL),
+          )
+      )(x_ref, o_ref)
+
+    x = jnp.arange(num_cores * 16 * grid_size * 128, dtype=jnp.int32).reshape(
+        (num_cores, 16, grid_size * 128)
+    )
+    out = jax.jit(run_kernel)(x)
+    expected_out = (
+        x
+        + grid_size
+        + 100 * jnp.arange(num_cores, dtype=jnp.int32)[:, None, None]
+    )
     np.testing.assert_allclose(out, expected_out)
 
   @parameterized.product(dynamic_grid=[True, False])
