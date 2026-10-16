@@ -1426,8 +1426,14 @@ class MpmdTest(PallasSCTest):
     ):
       body(x)
 
-  @parameterized.named_parameters(("wait_read", True), ("src_sem", False))
-  def test_async_copy_error_sc_vector_subcore_pull_stream(self, is_wait_read):
+  @parameterized.product(
+      is_wait_read=[True, False],
+      spaces=[(pltpu.HBM, pltpu.VMEM), (pltpu.VMEM_SHARED, pltpu.SMEM)],
+  )
+  def test_async_copy_error_sc_vector_subcore_pull_stream(
+      self, is_wait_read, spaces
+  ):
+    src_space, dst_space = spaces
     mesh = plsc.VectorSubcoreMesh(
         core_axis_name="c", subcore_axis_name="s", num_cores=1, num_subcores=1
     )
@@ -1437,8 +1443,8 @@ class MpmdTest(PallasSCTest):
         mesh=mesh,
         out_type=jax.ShapeDtypeStruct(x.shape, x.dtype),
         scratch_types=[
-            pltpu.HBM.like(x),
-            pltpu.VMEM.like(x),
+            src_space.like(x),
+            dst_space.like(x),
             pltpu.SemaphoreType.DMA(()) @ mesh,
         ],
     )
@@ -1452,8 +1458,14 @@ class MpmdTest(PallasSCTest):
     with self.assertRaisesRegex(ValueError, "only supported for push streams"):
       body(x)
 
-  @parameterized.named_parameters(("wait_read", True), ("src_sem", False))
-  def test_async_copy_error_sc_scalar_subcore_non_stream(self, is_wait_read):
+  @parameterized.product(
+      is_wait_read=[True, False],
+      spaces=[(pltpu.SMEM, pltpu.SMEM), (pltpu.VMEM_SHARED, pltpu.SMEM)],
+  )
+  def test_async_copy_error_sc_scalar_subcore_non_stream(
+      self, is_wait_read, spaces
+  ):
+    src_space, dst_space = spaces
     mesh = plsc.ScalarSubcoreMesh(axis_name="c", num_cores=1)
     x = jnp.zeros((self.num_lanes,), dtype=jnp.int32)
 
@@ -1461,8 +1473,8 @@ class MpmdTest(PallasSCTest):
         mesh=mesh,
         out_type=jax.ShapeDtypeStruct(x.shape, x.dtype),
         scratch_types=[
-            pltpu.SMEM.like(x),
-            pltpu.SMEM.like(x),
+            src_space.like(x),
+            dst_space.like(x),
             pltpu.SemaphoreType.DMA(()) @ mesh,
         ],
     )
