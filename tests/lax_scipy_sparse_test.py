@@ -210,8 +210,47 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
     self.assertAllClose(expected, actual.value)
 
   def test_cg_weak_types(self):
-    x, _ = jax.scipy.sparse.linalg.bicgstab(lambda x: x, 1.0)
+    x, _ = jax.scipy.sparse.linalg.cg(lambda x: x, 1.0)
     self.assertTrue(dtypes.is_weakly_typed(x))
+
+  @jtu.skip_on_devices("tpu")
+  def test_cg_preconditioned_rhs_scale(self):
+    rng = jtu.rand_default(self.rng())
+    n = 8
+    diag = jnp.exp2(jnp.linspace(0.0, 20.0, n, dtype=np.float32))
+    q = jnp.asarray(rng((n, n), np.float32))
+    A = jnp.diag(diag) + q @ q.T
+    M = jnp.diag(1.0 / jnp.diag(A))
+    b = jnp.asarray(rng((n,), np.float32))
+    x_ref, _ = jax.scipy.sparse.linalg.cg(A, b, tol=1e-6, M=M)
+    for k in (-60, 100):
+      scale = np.float32(2.0**k)
+      x_scaled, _ = jax.scipy.sparse.linalg.cg(
+          A, b * scale, x0=jnp.zeros_like(b), tol=1e-6, M=M
+      )
+      self.assertArraysEqual(x_scaled, x_ref * scale)
+
+  @jtu.skip_on_devices("tpu")
+  def test_cg_preconditioned_grad_small_cotangent(self):
+    rng = jtu.rand_default(self.rng())
+    n = 8
+    diag = jnp.exp2(jnp.linspace(0.0, 20.0, n, dtype=np.float32))
+    q = jnp.asarray(rng((n, n), np.float32))
+    A0 = jnp.diag(diag) + q @ q.T
+    b = jnp.asarray(rng((n,), np.float32))
+
+    def solve_sum(d):
+      A = A0 + jnp.diag(d)
+      M = lambda r: r / jnp.diag(A)
+      x, _ = jax.scipy.sparse.linalg.cg(A, b, tol=1e-6, M=M)
+      return jnp.sum(x)
+
+    d0 = jnp.zeros(n, dtype=np.float32)
+    grad_ref = jax.grad(solve_sum)(d0)
+    for k in (-60, 100):
+      scale = np.float32(2.0**k)
+      grad_scaled = jax.grad(lambda d: scale * solve_sum(d))(d0)
+      self.assertArraysEqual(grad_scaled, grad_ref * scale)
 
   # BICGSTAB
   @jtu.sample_product(
@@ -294,7 +333,6 @@ class LaxBackedScipyTests(jtu.JaxTestCase):
     self.assertAllClose(x, solution, atol=solution_tol, rtol=solution_tol)
     # solve = lambda A, b: jax.scipy.sparse.linalg.bicgstab(A, b)[0]
     # jtu.check_grads(solve, (A, b), order=1, rtol=3e-1)
-
 
   def test_bicgstab_pytree(self):
     A = lambda x: {"a": x["a"] + 0.5 * x["b"], "b": 0.5 * x["a"] + x["b"]}

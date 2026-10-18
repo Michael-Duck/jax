@@ -13,10 +13,8 @@
 # limitations under the License.
 
 
-from functools import partial
+from functools import partial, reduce
 import operator
-
-import numpy as np
 
 from jax._src import api
 from jax._src import dtypes
@@ -24,11 +22,13 @@ from jax._src import lax
 from jax._src import numpy as jnp
 from jax._src.lax import lax as lax_internal
 from jax._src.numpy import einsum as jnp_einsum
+from jax._src.numpy import ufuncs
 from jax._src.scipy import linalg as jsp_linalg
-from jax._src.tree_util import (tree_leaves, tree_map, tree_structure,
-                                tree_reduce, Partial)
+from jax._src.tree_util import ( Partial,tree_leaves, tree_map,
+                                tree_reduce, tree_structure)
 from jax._src.typing import Array, ArrayLike
 from jax._src.util import safe_map as map
+import numpy as np
 
 
 _dot = partial(jnp.dot, precision=lax.Precision.HIGHEST)
@@ -100,10 +100,51 @@ def _normalize_matvec(f):
         f'linear operator must be either a function or ndarray: {f}')
 
 
+def _max_abs_exponent(tree):
+  leaves = [x for x in tree_leaves(tree) if np.size(x) > 0]
+  if not leaves:
+    return np.int32(0)
+  min_i32 = np.int32(np.iinfo(np.int32).min)
+  exps = []
+  finites = []
+  for x in leaves:
+    leaf_max = jnp.max(jnp.abs(x.real))
+    if jnp.iscomplexobj(x):
+      leaf_max = lax.max(leaf_max, jnp.max(jnp.abs(x.imag)))
+    m, e = ufuncs.frexp(leaf_max)
+    finites.append(jnp.isfinite(m))
+    exps.append(jnp.where(m > 0, e, min_i32))
+  exp = reduce(lax.max, exps)
+  finite = reduce(operator.and_, finites)
+  return jnp.where(finite & (exp > min_i32), exp, np.int32(0))
+
+
+def _ldexp_tree(tree, exp):
+  def scale_leaf(x):
+    dtype = dtypes.dtype(x)
+    weak_type = dtypes.is_weakly_typed(x)
+    if dtypes.issubdtype(dtype, np.complexfloating):
+      out = lax.complex(ufuncs.ldexp(x.real, exp), ufuncs.ldexp(x.imag, exp))
+    else:
+      out = ufuncs.ldexp(x, exp)
+    return lax_internal._convert_element_type(out, dtype, weak_type)
+
+  return tree_map(scale_leaf, tree)
+
+
 def _cg_solve(A, b, x0=None, *, maxiter, tol=1e-5, atol=0.0, M=_identity):
+  # Rescale by a power of two so inner products do not underflow or overflow
+  # for extreme right-hand side magnitudes (e.g. reverse-mode cotangents),
+  # while keeping normal-range arithmetic bitwise identical.
+  exp = _max_abs_exponent(b)
+  b = _ldexp_tree(b, -exp)
+  x0 = _ldexp_tree(x0, -exp)
 
   # tolerance handling uses the "non-legacy" behavior of scipy.sparse.linalg.cg
   bs = _vdot_real_tree(b, b)
+  atol = ufuncs.ldexp(
+      lax_internal._convert_element_type(atol, dtypes.dtype(bs)), -exp
+  )
   atol2 = jnp.maximum(jnp.square(tol) * bs, jnp.square(atol))
 
   # https://en.wikipedia.org/wiki/Conjugate_gradient_method#The_preconditioned_conjugate_gradient_method
@@ -116,24 +157,30 @@ def _cg_solve(A, b, x0=None, *, maxiter, tol=1e-5, atol=0.0, M=_identity):
   def body_fun(value):
     x, r, gamma, p, k = value
     Ap = A(p)
-    alpha = gamma / _vdot_real_tree(p, Ap).astype(dtype)
+    alpha = gamma / lax_internal._convert_element_type(
+        _vdot_real_tree(p, Ap), dtype, weak_type
+    )
     x_ = _add(x, _mul(alpha, p))
     r_ = _sub(r, _mul(alpha, Ap))
     z_ = M(r_)
-    gamma_ = _vdot_real_tree(r_, z_).astype(dtype)
+    gamma_ = lax_internal._convert_element_type(
+        _vdot_real_tree(r_, z_), dtype, weak_type
+    )
     beta_ = gamma_ / gamma
     p_ = _add(z_, _mul(beta_, p))
     return x_, r_, gamma_, p_, k + 1
 
   r0 = _sub(b, A(x0))
   p0 = z0 = M(r0)
-  dtype = dtypes.result_type(*tree_leaves(p0))
-  gamma0 = _vdot_real_tree(r0, z0).astype(dtype)
+  dtype, weak_type = dtypes.lattice_result_type(*tree_leaves(p0))
+  gamma0 = lax_internal._convert_element_type(
+      _vdot_real_tree(r0, z0), dtype, weak_type
+  )
   initial_value = (x0, r0, gamma0, p0, 0)
 
   x_final, *_ = lax.while_loop(cond_fun, body_fun, initial_value)
 
-  return x_final
+  return _ldexp_tree(x_final, exp)
 
 
 # aliases for working with pytrees
