@@ -1460,6 +1460,57 @@ class PallasCallDMATest(ptu.PallasTPUTest):
     )(x)
     np.testing.assert_array_equal(y, x)
 
+  @parameterized.named_parameters(
+      ('hbm_vmem', True),
+      ('vmem_vmem', False),
+  )
+  def test_local_dma_source_semaphore_and_wait_read(self, use_hbm):
+    if self.INTERPRET:
+      self.skipTest('TODO(sharadmv, justinfu): Add interpret support for DMA.')
+    if not jtu.is_libtpu_at_least('0.0.51'):
+      self.skipTest('Requires libtpu >= 0.0.51')
+
+    shape = (8, 128)
+    x = jnp.arange(np.prod(shape), dtype=jnp.float32).reshape(shape)
+
+    def kernel(x_ref, y_ref, vmem_buf, src_sem, dst_sem):
+      if use_hbm:
+        copy_in = pltpu.make_async_copy(
+            x_ref, vmem_buf, sem=dst_sem, src_sem=src_sem
+        )
+        copy_in.start()
+        copy_in.wait()
+        copy_out = pltpu.make_async_copy(
+            vmem_buf, y_ref, sem=dst_sem, src_sem=src_sem
+        )
+        copy_out.start()
+        copy_out.wait_read()
+        vmem_buf[...] = jnp.zeros_like(vmem_buf[...])
+        copy_out.wait_write()
+      else:
+        vmem_buf[...] = x_ref[...]
+        copy_vmem = pltpu.make_async_copy(
+            vmem_buf, y_ref, sem=dst_sem, src_sem=src_sem
+        )
+        copy_vmem.start()
+        copy_vmem.wait_read()
+        vmem_buf[...] = jnp.zeros_like(vmem_buf[...])
+        copy_vmem.wait_write()
+
+    mem_space = pltpu.HBM if use_hbm else pltpu.VMEM
+    y = self.pallas_call(
+        kernel,
+        in_specs=[pl.BlockSpec(memory_space=mem_space)],
+        out_specs=pl.BlockSpec(memory_space=mem_space),
+        out_shape=jax.ShapeDtypeStruct(shape, jnp.float32),
+        scratch_shapes=[
+            pltpu.VMEM(shape, jnp.float32),
+            pltpu.SemaphoreType.DMA,
+            pltpu.SemaphoreType.DMA,
+        ],
+    )(x)
+    np.testing.assert_array_equal(y, x)
+
   def test_output_dma_semaphore_ref(self):
     if self.INTERPRET:
       self.skipTest('TODO(sharadmv, justinfu): Add interpret support for DMA.')
