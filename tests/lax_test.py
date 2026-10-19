@@ -43,7 +43,6 @@ from jax._src import literals
 from jax._src import test_util as jtu
 from jax._src.errors import UnexpectedTracerError
 from jax._src.interpreters import mlir
-from jax._src.lib import jaxlib_extension_version
 from jax._src.interpreters import pxla
 from jax._src.internal_test_util import lax_test_util
 from jax._src.lax import lax as lax_internal
@@ -1995,9 +1994,6 @@ class LaxTest(jtu.JaxTestCase):
     with self.assertRaises(TypeError):
       lax.dynamic_slice_in_dim(x, jnp.array([2, 2]), 3)
 
-  @unittest.skipIf(
-      jaxlib_extension_version < 498, "Requires jaxlib_extension_version >= 498"
-  )
   def testNestedDynamicSliceOutOfBounds(self):
     # Regression test for https://github.com/jax-ml/jax/issues/40849
     buf = jnp.arange(10, dtype=np.int32)
