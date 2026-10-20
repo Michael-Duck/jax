@@ -1883,7 +1883,8 @@ def _mirror_tree_map(f, td, leaves):
   ty, aux = node_data
   children = [_mirror_tree_map(f, c, leaves) for c in td.children()]
   return (children if ty is list else dict(zip(aux, children)) if ty is dict
-          else None if ty is type(None) else tuple(children))
+          else None if ty is type(None) else ft.FTPyTree(children, aux)
+          if ty is ft.FTPyTree else tuple(children))
 
 def _out_nzs(out_tree, out_zeros):
   return mirror_tree_map(lambda z: not z, out_tree, out_zeros)
